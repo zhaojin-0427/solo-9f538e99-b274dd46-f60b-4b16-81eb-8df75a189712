@@ -11,8 +11,8 @@ from fastapi.responses import JSONResponse
 
 from . import __version__
 from .database import Database, RevisionConflict
-from .geometry import GeometryError, build_polygon_geojson
-from .models import RevisionIn, RevisionResult
+from .geometry import GeometryError, build_polygon_geojson, overlap_feature_collection
+from .models import OverlapRequest, OverlapResult, RevisionIn, RevisionResult
 
 def _database_path() -> str:
     # Read lazily so tests (and redeployed env) can override FLOOD_DB_PATH.
@@ -183,5 +183,84 @@ def read_current(relation_id: int, request: Request) -> RevisionResult:
                 "current revision is invalid and the face is not being served; "
                 "fetch last_valid_revision for the previous valid polygon"
             ),
+        },
+    )
+
+
+@app.post(
+    "/overlaps",
+    response_model=OverlapResult,
+    tags=["overlap-qc"],
+    summary="Cross-relation overlap QC: partition shared water area by exact coverage",
+)
+def compute_overlaps(payload: OverlapRequest, request: Request) -> OverlapResult:
+    """Pin each relation's current revision from one committed snapshot.
+
+    The latest revision of every requested relation is read inside a
+    single read transaction, so an upload landing while the request runs
+    cannot make the result mix revisions from before and after that
+    upload; ``relation_revisions`` reports the exact revision used.
+
+    The returned GeoJSON ``FeatureCollection`` contains one feature per
+    positive-area exact-coverage cell: each cell is covered by precisely
+    the relation ids in ``properties.relations`` (at least two) and by no
+    other input relation. Cells are mutually disjoint, so a point covered
+    by three relations only appears in the three-relation feature and
+    never in any pairwise one. Holes stay holes; boundary-only contact has
+    no area and yields no feature.
+
+    The whole group fails (no partial answer, no fallback to an older
+    valid revision) when a relation has no stored revision (404) or its
+    current revision is invalid (409).
+    """
+    db = _db(request)
+    relation_ids = sorted(set(payload.relation_ids))
+
+    # One read transaction -> one WAL snapshot shared by every relation.
+    latest_by_relation = db.get_latest_revisions_bulk(relation_ids)
+
+    missing = [rid for rid in relation_ids if rid not in latest_by_relation]
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "relation_not_found",
+                "message": "no revision stored for one or more requested relations",
+                "relation_ids": missing,
+            },
+        )
+
+    invalid = [
+        rid for rid in relation_ids if latest_by_relation[rid]["status"] != "valid"
+    ]
+    if invalid:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "current_revision_invalid",
+                "message": (
+                    "the current revision of one or more relations is invalid; "
+                    "the whole group is rejected without falling back to an "
+                    "older valid revision"
+                ),
+                "relation_ids": invalid,
+                "current_revisions": {
+                    str(rid): latest_by_relation[rid]["revision"] for rid in invalid
+                },
+                "errors": {
+                    str(rid): latest_by_relation[rid]["error"] for rid in invalid
+                },
+            },
+        )
+
+    pinned = {rid: latest_by_relation[rid] for rid in relation_ids}
+    polygons_geojson = {rid: row["geometry"] for rid, row in pinned.items()}
+    feature_collection = overlap_feature_collection(polygons_geojson)
+
+    return OverlapResult(
+        type=feature_collection["type"],
+        features=feature_collection["features"],
+        relation_revisions={
+            str(rid): pinned[rid]["revision"] for rid in relation_ids
         },
     )

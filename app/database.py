@@ -186,6 +186,58 @@ class Database:
             ).fetchone()
             return self._row_to_dict(row) if row else None
 
+    def get_latest_revisions_bulk(
+        self, relation_ids: list[int], inside_snapshot=None
+    ) -> dict[int, dict]:
+        """Return the latest row of every relation from one committed snapshot.
+
+        The whole read runs inside a single deferred read transaction.
+        In WAL mode a read transaction pins one database snapshot for its
+        whole lifetime, so a revision upload committing while this call is
+        in flight can never make the returned set mix pre-upload and
+        post-upload revisions: every row comes from the same snapshot.
+        Relations without any stored row are simply absent from the result.
+
+        ``inside_snapshot`` is an optional callback invoked after the
+        snapshot-acquiring read has run (the transaction is still open); it
+        exists for tests that need to race a writer against the open
+        snapshot while proving the already-fetched rows stay unchanged.
+        """
+        ids = sorted(set(relation_ids))
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            try:
+                # Run the data read before any hook: in Python's sqlite3
+                # wrapper a deferred BEGIN only acquires its WAL snapshot
+                # on the first statement, so this SELECT is what pins the
+                # snapshot for the whole transaction.
+                rows = conn.execute(
+                    f"""
+                    SELECT r.*
+                    FROM revisions r
+                    JOIN (
+                        SELECT relation_id, MAX(revision) AS max_revision
+                        FROM revisions
+                        WHERE relation_id IN ({placeholders})
+                        GROUP BY relation_id
+                    ) m
+                      ON r.relation_id = m.relation_id
+                     AND r.revision = m.max_revision
+                    """,
+                    ids,
+                ).fetchall()
+                if inside_snapshot is not None:
+                    inside_snapshot()
+                result = {row["relation_id"]: self._row_to_dict(row) for row in rows}
+                conn.commit()
+                return result
+            except Exception:
+                conn.rollback()
+                raise
+
     def get_last_valid(self, relation_id: int) -> dict | None:
         with self._connect() as conn:
             row = conn.execute(

@@ -15,9 +15,17 @@ Rules implemented (per the flood-analysis contract):
 from __future__ import annotations
 
 from collections import defaultdict
+from itertools import combinations
 
-from shapely.geometry import LinearRing, Polygon, mapping
-from shapely.validation import explain_validity
+from shapely.geometry import (
+    GeometryCollection,
+    LinearRing,
+    MultiPolygon,
+    Polygon,
+    mapping,
+    shape,
+)
+from shapely.validation import explain_validity, make_valid
 
 from .models import RevisionIn
 
@@ -250,3 +258,124 @@ def build_polygon_geojson(payload: RevisionIn) -> dict:
         )
 
     return mapping(polygon)
+
+
+# --------------------------------------------------------------- cross-relation
+def _polygonal_parts(geometry) -> list:
+    """Flatten a shapely overlay result into area-bearing polygons only.
+
+    Overlays may return ``GeometryCollection`` results mixing polygons
+    with zero-area lines/points (e.g. boundary-only contact). Lines and
+    points are dropped, empty and zero-area polygons are dropped, so
+    edge-only contact can never be reported as overlap.
+    """
+    if geometry is None or geometry.is_empty:
+        return []
+    if isinstance(geometry, Polygon):
+        candidates = [geometry]
+    elif isinstance(geometry, MultiPolygon):
+        candidates = list(geometry.geoms)
+    elif isinstance(geometry, GeometryCollection):
+        candidates = []
+        for part in geometry.geoms:
+            candidates.extend(_polygonal_parts(part))
+    else:  # LineString / Point / ... -> no area
+        return []
+    return [p for p in candidates if not p.is_empty and p.area > 0.0]
+
+
+def partition_overlaps(
+    polygons_geojson: dict[int, dict],
+) -> list[tuple[tuple[int, ...], list]]:
+    """Split several relation polygons into exact-coverage overlap cells.
+
+    ``polygons_geojson`` maps a relation id to the stored GeoJSON Polygon
+    of the pinned revision of that relation. For every subset of at least
+    two relations, the function returns the area covered by **exactly**
+    that subset and by no other input relation, as one or more shapely
+    polygons.
+
+    Consequences of the exact-coverage definition:
+
+    * a point covered by three relations belongs only to the three-way
+      cell and never to any pairwise cell;
+    * a hole inside every covering polygon stays a hole (no area);
+    * polygons that only touch along a boundary share zero area and
+      produce no cell at all.
+
+    The returned list is ordered by the (sorted) relation-id tuple and
+    contains only positive-area cells.
+    """
+    relation_ids = sorted(polygons_geojson)
+    polygons: dict[int, Polygon] = {
+        rid: shape(polygons_geojson[rid]) for rid in relation_ids
+    }
+
+    # Cache intersections so larger subsets reuse pairwise intermediates.
+    intersection_cache: dict[tuple[int, ...], object] = {}
+
+    def intersect(subset: tuple[int, ...]):
+        if subset in intersection_cache:
+            return intersection_cache[subset]
+        if len(subset) == 1:
+            result = polygons[subset[0]]
+        else:
+            result = intersect(subset[:-1]).intersection(polygons[subset[-1]])
+        intersection_cache[subset] = result
+        return result
+
+    cells: list[tuple[tuple[int, ...], list]] = []
+    for size in range(2, len(relation_ids) + 1):
+        for subset_tuple in combinations(relation_ids, size):
+            shared = intersect(subset_tuple)
+            if shared.is_empty:
+                continue
+            others = [rid for rid in relation_ids if rid not in subset_tuple]
+            cell = shared
+            for other in others:
+                cell = cell.difference(polygons[other])
+                if cell.is_empty:
+                    break
+            parts = _polygonal_parts(cell)
+            if not parts:
+                continue
+            # Defensive: inputs are validated polygons, but repair any
+            # robustness artefact of the overlay before reporting it.
+            repaired: list = []
+            for part in parts:
+                if not part.is_valid:
+                    fixed = make_valid(part)
+                    repaired.extend(_polygonal_parts(fixed))
+                else:
+                    repaired.append(part)
+            if repaired:
+                cells.append((subset_tuple, repaired))
+
+    return cells
+
+
+def overlap_feature_collection(
+    polygons_geojson: dict[int, dict],
+) -> dict:
+    """Build the GeoJSON ``FeatureCollection`` of exact-coverage overlap cells.
+
+    Every feature's ``properties.relations`` is the sorted set of relation
+    ids whose pinned polygons cover that exact cell; the cells are mutually
+    disjoint and pairwise subsets never include area also covered by a
+    third relation.
+    """
+    features = []
+    for subset_tuple, parts in partition_overlaps(polygons_geojson):
+        # Stable, content-based ordering even when a cell splits into
+        # several disjoint polygons.
+        parts = sorted(parts, key=lambda part: (round(part.area, 12), part.wkb.hex()))
+        for part in parts:
+            geometry = mapping(part)
+            features.append(
+                {
+                    "type": "Feature",
+                    "properties": {"relations": list(subset_tuple)},
+                    "geometry": geometry,
+                }
+            )
+    return {"type": "FeatureCollection", "features": features}

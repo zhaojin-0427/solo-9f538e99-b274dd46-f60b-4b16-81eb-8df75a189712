@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, model_validator
 # Hard limits required by the specification.
 MAX_WAYS_PER_REVISION = 8
 MAX_NODES_PER_REVISION = 32
+MAX_RELATIONS_PER_OVERLAP = 8
 
 
 class NodeIn(BaseModel):
@@ -51,6 +52,45 @@ class ErrorDetail(BaseModel):
     code: str
     message: str
     way_ids: list[int] = Field(default_factory=list)
+
+
+class OverlapRequest(BaseModel):
+    relation_ids: list[int] = Field(
+        ...,
+        min_length=2,
+        max_length=MAX_RELATIONS_PER_OVERLAP,
+        description="2..8 distinct OSM relation ids whose current revisions "
+        "are checked for overlapping water area",
+    )
+
+    @model_validator(mode="after")
+    def _distinct_relations(self) -> "OverlapRequest":
+        if len(set(self.relation_ids)) != len(self.relation_ids):
+            raise ValueError("relation_ids must be distinct")
+        return self
+
+
+class OverlapFeature(BaseModel):
+    type: Literal["Feature"]
+    properties: dict = Field(
+        ...,
+        description="Contains 'relations': the exact set of relation ids "
+        "(sorted) whose pinned revisions cover this cell and no others do",
+    )
+    geometry: dict = Field(..., description="GeoJSON Polygon/MultiPolygon of one overlap cell")
+
+
+class OverlapResult(BaseModel):
+    type: Literal["FeatureCollection"]
+    features: list[OverlapFeature] = Field(
+        default_factory=list,
+        description="Mutually disjoint, positive-area overlap cells; "
+        "empty when no point is covered by at least two pinned polygons",
+    )
+    relation_revisions: dict[str, int] = Field(
+        ...,
+        description="The pinned revision number actually used for each relation id",
+    )
 
 
 class RevisionResult(BaseModel):
